@@ -6,7 +6,7 @@ from compliance_mcp.api_client import APIError, api_get
 from compliance_mcp.config import MCPConfig
 
 _config = MCPConfig()
-VALID_STAT_TYPES = {"count", "list", "usage", "cache-stats"}
+VALID_STAT_TYPES = {"count", "list", "usage", "cache-stats", "reviewer-groups"}
 
 
 def compliance_stats(stat_type: str) -> str:

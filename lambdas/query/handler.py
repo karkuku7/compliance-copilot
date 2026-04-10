@@ -61,7 +61,7 @@ def _handle_exact(record_id: str, event: dict) -> dict:
         return _response(404, {"error": f"Record '{record_id}' not found"})
 
     # Track usage (fire-and-forget)
-    _record_usage(record_id, event)
+    _record_usage(record_id, event, cache_item=item)
 
     # Handle S3 overflow
     if item.get("s3_overflow"):
@@ -129,6 +129,8 @@ def _handle_stats(params: dict) -> dict:
     elif stat_type == "usage":
         response = usage_table.scan()
         items = response.get("Items", [])
+        for item in items:
+            item.setdefault("legal_reviewer_group", "")
         return _response(200, {"usage": items, "count": len(items)})
 
     elif stat_type == "cache-stats":
@@ -141,7 +143,39 @@ def _handle_stats(params: dict) -> dict:
             "inline_items": len(items) - overflow_count,
         })
 
+    elif stat_type == "reviewer-groups":
+        return _stats_reviewer_groups()
+
     return _response(400, {"error": f"Invalid stat type: {stat_type}"})
+
+
+def _stats_reviewer_groups() -> dict:
+    """Return per-reviewer-group aggregated usage statistics."""
+    response = usage_table.scan()
+    items = response.get("Items", [])
+
+    groups: dict[str, dict] = {}
+    for item in items:
+        group = item.get("legal_reviewer_group") or "Unknown"
+        if not group or not group.strip():
+            group = "Unknown"
+        if group not in groups:
+            groups[group] = {"unique_apps": 0, "total_lookups": 0}
+        groups[group]["unique_apps"] += 1
+        hit_count = item.get("hit_count", 0)
+        groups[group]["total_lookups"] += int(hit_count)
+
+    result = [
+        {
+            "reviewer_group": g,
+            "unique_apps": data["unique_apps"],
+            "total_lookups": data["total_lookups"],
+        }
+        for g, data in groups.items()
+    ]
+    result.sort(key=lambda x: x["total_lookups"], reverse=True)
+
+    return _response(200, {"groups": result})
 
 
 def _fetch_from_s3(s3_key: str) -> dict | None:
@@ -154,14 +188,27 @@ def _fetch_from_s3(s3_key: str) -> dict | None:
         return None
 
 
-def _record_usage(record_id: str, event: dict) -> None:
-    """Track usage via atomic counter (fire-and-forget)."""
+def _record_usage(record_id: str, event: dict, cache_item: dict | None = None) -> None:
+    """Track usage via atomic counter (fire-and-forget).
+
+    Persists legal_reviewer_group from the cache item on every hit.
+    """
     try:
         now = datetime.now(timezone.utc).isoformat()
         reviewer = (event.get("headers") or {}).get("x-reviewer-alias", "")
 
-        update_expr = "ADD hit_count :one SET last_hit = :now"
-        expr_values: dict[str, Any] = {":one": 1, ":now": now}
+        # Extract legal_reviewer_group from cache item
+        if cache_item is not None:
+            data = cache_item.get("data", cache_item) if isinstance(cache_item, dict) else {}
+            reviewer_group = data.get("app_legal_reviewer_group", "")
+        else:
+            reviewer_group = ""
+
+        update_expr = (
+            "ADD hit_count :one "
+            "SET last_hit = :now, legal_reviewer_group = :rg"
+        )
+        expr_values: dict[str, Any] = {":one": 1, ":now": now, ":rg": reviewer_group}
 
         if reviewer:
             update_expr += ", last_reviewer = :reviewer ADD reviewers :reviewer_set"

@@ -69,7 +69,8 @@ async def run_server():
             name="compliance_stats",
             description=(
                 "Retrieve read-only cache and usage statistics. "
-                "Returns counts, record lists, usage metrics, or cache health."
+                "Returns counts, record lists, usage metrics, cache health, "
+                "or per-reviewer-group aggregated statistics."
             ),
         ),
     ]
