@@ -58,6 +58,7 @@ def api_get(
 
     req = urllib.request.Request(url)
     req.add_header("X-Source", "mcp")
+    req.add_header("X-Tool-Version", "mcp-1.0")
     if tool_name:
         req.add_header("X-Tool", tool_name)
 
