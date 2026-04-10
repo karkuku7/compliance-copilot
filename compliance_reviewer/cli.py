@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
 from compliance_reviewer.errors import (
     DataRetrievalError,
@@ -95,6 +97,36 @@ def main() -> None:
         sys.exit(130)
 
 
+def _next_sequence_number(output_dir: str, base_pattern: str) -> int:
+    """Return the next available sequence number for a report filename.
+
+    Scans *output_dir* for files whose names match *base_pattern* (a regex
+    that must contain a single capturing group for the sequence digits) and
+    returns ``max(existing) + 1``.  Defaults to ``1`` when no matching files
+    are found.  There is no artificial upper cap — sequence 999 is followed
+    by 1000.
+
+    Args:
+        output_dir: Directory to scan for existing report files.
+        base_pattern: Regex pattern with one capture group for the sequence
+            number, e.g. ``r"REC-42_review_20250715_(\\d+)\\.md$"``.
+
+    Returns:
+        The next sequence number (≥ 1).
+    """
+    pattern = re.compile(base_pattern)
+    seq_numbers: List[int] = []
+    try:
+        for entry in os.listdir(output_dir):
+            m = pattern.match(entry)
+            if m:
+                seq_numbers.append(int(m.group(1)))
+    except OSError:
+        # Directory doesn't exist or isn't readable — start at 1.
+        pass
+    return max(seq_numbers) + 1 if seq_numbers else 1
+
+
 def _run_review(args: argparse.Namespace) -> None:
     """Execute the full review pipeline."""
     record_id = args.record_id.strip()
@@ -140,7 +172,9 @@ def _run_review(args: argparse.Namespace) -> None:
     # Step 6: Write report
     output_dir = args.output_dir or os.getcwd()
     date_str = datetime.now().strftime("%Y%m%d")
-    filename = f"{record_id}_review_{date_str}.md"
+    base_pattern = re.escape(record_id) + r"_review_" + re.escape(date_str) + r"_(\d+)\.md$"
+    seq = _next_sequence_number(output_dir, base_pattern)
+    filename = f"{record_id}_review_{date_str}_{seq:03d}.md"
     filepath = os.path.join(output_dir, filename)
 
     try:
