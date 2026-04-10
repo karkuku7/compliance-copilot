@@ -61,6 +61,21 @@ class ComplianceCopilotStack(Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
+        # --- DynamoDB Tool Versions Table ---
+        # Stores latest and minimum required versions per tool
+        # for the auto-update check endpoint.
+        tool_versions_table = dynamodb.Table(
+            self, "ToolVersionsTable",
+            table_name="Compliance_Tool_Versions",
+            partition_key=dynamodb.Attribute(
+                name="tool_name", type=dynamodb.AttributeType.STRING,
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.RETAIN,
+            point_in_time_recovery=True,
+            encryption=dynamodb.TableEncryption.AWS_MANAGED,
+        )
+
         # --- S3 Overflow Bucket ---
         overflow_bucket = s3.Bucket(
             self, "OverflowBucket",
@@ -115,6 +130,10 @@ class ComplianceCopilotStack(Stack):
         cache_table.grant_read_data(query_lambda)
         usage_table.grant_read_write_data(query_lambda)
         overflow_bucket.grant_read(query_lambda)
+        tool_versions_table.grant_read_data(query_lambda)
+
+        # Pass tool versions table name to Query Lambda environment
+        query_lambda.add_environment("TOOL_VERSIONS_TABLE_NAME", tool_versions_table.table_name)
 
         # --- API Gateway ---
         api = apigwv2.HttpApi(
@@ -137,6 +156,11 @@ class ComplianceCopilotStack(Stack):
         )
         api.add_routes(
             path="/stats",
+            methods=[apigwv2.HttpMethod.GET],
+            integration=integration,
+        )
+        api.add_routes(
+            path="/version",
             methods=[apigwv2.HttpMethod.GET],
             integration=integration,
         )

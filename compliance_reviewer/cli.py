@@ -4,18 +4,20 @@ Orchestrates: parse args → fetch attestation → assemble prompt → invoke LL
 """
 
 import argparse
+import importlib.metadata
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from compliance_reviewer.errors import (
     DataRetrievalError,
@@ -25,8 +27,44 @@ from compliance_reviewer.errors import (
     ReportWriteError,
     ReviewerError,
 )
+from compliance_reviewer.version_check import check_version_sync
 
 logger = logging.getLogger(__name__)
+
+TOOL_NAME = "compliance-copilot"
+
+# Global holder for the background update-available notification message.
+_update_notification: Optional[str] = None
+
+
+def _get_local_version() -> str:
+    """Return the locally installed version of the package.
+
+    Falls back to ``"0.0.0"`` if the package metadata is unavailable
+    (e.g. running from source without installing).
+    """
+    try:
+        return importlib.metadata.version(TOOL_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0"
+
+
+def _background_update_check(tool_name: str, local_version: str) -> None:
+    """Run a version check in a background thread.
+
+    If an update is available, stores the notification message in the
+    module-level ``_update_notification`` so the caller can print it
+    after the primary command completes.
+
+    On any error (network failure, etc.) silently continues.
+    """
+    global _update_notification
+    try:
+        result = check_version_sync(tool_name, local_version)
+        if result.status == "update_available":
+            _update_notification = result.message
+    except Exception:
+        pass  # Silently continue
 
 DEFAULT_API_URL = os.environ.get(
     "COMPLIANCE_API_URL", "http://localhost:8080"
@@ -42,7 +80,7 @@ def create_parser() -> argparse.ArgumentParser:
         description="LLM-powered compliance attestation review",
     )
     parser.add_argument(
-        "--record", "--app", required=True, dest="record_id",
+        "--record", "--app", required=False, default=None, dest="record_id",
         help="Compliance record ID to review",
     )
     parser.add_argument(
@@ -74,12 +112,48 @@ def create_parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", default=False,
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--check-update",
+        action="store_true",
+        default=False,
+        dest="check_update",
+        help="Check for available updates and exit without running the review.",
+    )
     return parser
 
 
 def main() -> None:
+    global _update_notification
+    _update_notification = None
+
     parser = create_parser()
     args = parser.parse_args()
+
+    local_version = _get_local_version()
+
+    # --- Handle --check-update: skip primary command ---
+    if args.check_update:
+        result = check_version_sync(TOOL_NAME, local_version, skip_cache=True)
+        print(result.message, file=sys.stderr)
+        sys.exit(1 if result.status == "blocked" else 0)
+
+    # Validate --record is provided when not using --check-update
+    if not args.record_id:
+        parser.error("the following arguments are required: --record/--app")
+
+    # --- Synchronous minimum-version block check ---
+    block_result = check_version_sync(TOOL_NAME, local_version)
+    if block_result.status == "blocked":
+        print(block_result.message, file=sys.stderr)
+        sys.exit(1)
+
+    # --- Start background update-available check ---
+    bg_thread = threading.Thread(
+        target=_background_update_check,
+        args=(TOOL_NAME, local_version),
+        daemon=True,
+    )
+    bg_thread.start()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -95,6 +169,11 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         sys.exit(130)
+    finally:
+        # --- After primary command, print notification if available ---
+        bg_thread.join(timeout=5)
+        if _update_notification:
+            print(_update_notification, file=sys.stderr)
 
 
 def _next_sequence_number(output_dir: str, base_pattern: str) -> int:

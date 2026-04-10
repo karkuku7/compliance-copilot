@@ -21,6 +21,7 @@ logger.setLevel(logging.INFO)
 CACHE_TABLE = os.environ.get("CACHE_TABLE_NAME", "ComplianceCopilot_Cache")
 USAGE_TABLE = os.environ.get("USAGE_TABLE_NAME", "ComplianceCopilot_Usage")
 OVERFLOW_BUCKET = os.environ.get("OVERFLOW_BUCKET", "compliance-copilot-cache-overflow")
+TOOL_VERSIONS_TABLE = os.environ.get("TOOL_VERSIONS_TABLE_NAME", "Compliance_Tool_Versions")
 
 dynamodb = boto3.resource("dynamodb")
 cache_table = dynamodb.Table(CACHE_TABLE)
@@ -38,6 +39,9 @@ def handler(event: dict, context: Any) -> dict:
 
         if path.startswith("/stats"):
             return _handle_stats(params)
+
+        if path.startswith("/version"):
+            return _handle_version(params)
 
         if not record_id:
             return _response(400, {"error": "Missing required parameter: record_id"})
@@ -111,6 +115,36 @@ def _handle_partial(search_term: str) -> dict:
                 results.append(item.get("data", item))
 
     return _response(200, results)
+
+
+def _handle_version(params: dict) -> dict:
+    """Handle /version requests — return latest and minimum required version for a tool.
+
+    Query params:
+        tool_name (required): Tool identifier to look up
+
+    Returns:
+        200 + JSON with tool_name, latest_version, minimum_required_version
+        400 if tool_name missing
+        404 if tool_name not found
+    """
+    tool_name = params.get("tool_name", "").strip()
+
+    if not tool_name:
+        return _response(400, {"error": "Missing required parameter: tool_name"})
+
+    versions_table = dynamodb.Table(TOOL_VERSIONS_TABLE)
+    result = versions_table.get_item(Key={"tool_name": tool_name})
+    item = result.get("Item")
+
+    if not item:
+        return _response(404, {"error": f"Unknown tool: {tool_name}"})
+
+    return _response(200, {
+        "tool_name": item["tool_name"],
+        "latest_version": item.get("latest_version", ""),
+        "minimum_required_version": item.get("minimum_required_version", ""),
+    })
 
 
 def _handle_stats(params: dict) -> dict:

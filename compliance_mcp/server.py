@@ -6,6 +6,7 @@ compliance_findings, compliance_stats.
 Uses FastMCP with stdio transport.
 """
 
+import logging
 import os
 import signal
 
@@ -18,6 +19,10 @@ from compliance_mcp.tools.findings import compliance_findings
 from compliance_mcp.tools.lookup import compliance_lookup
 from compliance_mcp.tools.review import compliance_review
 from compliance_mcp.tools.stats import compliance_stats
+from compliance_mcp.utils import get_package_version
+from compliance_mcp.version_check import check_version_async
+
+logger = logging.getLogger(__name__)
 
 
 async def signal_handler(scope: CancelScope):
@@ -26,6 +31,27 @@ async def signal_handler(scope: CancelScope):
         async for _ in signals:
             print("Shutting down MCP server...")
             os._exit(0)
+
+
+def _block_all_tools(mcp: FastMCP, block_message: str) -> None:
+    """Replace all registered tool handlers with a blocker that returns the block message.
+
+    Iterates over the internal tool registry and swaps each tool's ``fn``
+    attribute with an async wrapper that always raises ``ToolError`` with
+    the provided *block_message*.  This ensures every tool invocation
+    returns the update-required error to the caller.
+    """
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    tools = mcp._tool_manager._tools
+
+    for tool_name, tool in tools.items():
+
+        async def _blocked_handler(**kwargs: object) -> str:
+            raise ToolError(block_message)
+
+        tool.fn = _blocked_handler
+        tool.is_async = True
 
 
 async def run_server():
@@ -37,6 +63,8 @@ async def run_server():
             "automated structured reviews, findings interpretation, and cache statistics."
         ),
     )
+
+    mcp._mcp_server.version = get_package_version()
 
     tools = [
         Tool.from_function(
@@ -82,6 +110,27 @@ async def run_server():
             description=tool.description,
             annotations=tool.annotations,
         )
+
+    # Version check (non-blocking, 5-second timeout enforced by version_check module)
+    try:
+        version_result = await check_version_async(
+            "compliance-copilot", get_package_version()
+        )
+
+        if version_result.status == "blocked":
+            _block_all_tools(mcp, version_result.message)
+            logger.warning(
+                "Version blocked: %s", version_result.message
+            )
+        elif version_result.status == "update_available":
+            logger.info(version_result.message)
+        elif version_result.status == "error":
+            logger.warning(
+                "Version check error, continuing normally: %s",
+                version_result.message,
+            )
+    except Exception:
+        logger.warning("Version check failed unexpectedly, continuing normally", exc_info=True)
 
     async with create_task_group() as tg:
         tg.start_soon(signal_handler, tg.cancel_scope)

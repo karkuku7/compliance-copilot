@@ -38,6 +38,9 @@ def quote_table(table_name: str) -> str:
 # --- DynamoDB ---
 CACHE_TABLE_NAME = os.environ.get("CC_CACHE_TABLE_NAME", "ComplianceCopilot_Cache")
 USAGE_TABLE_NAME = os.environ.get("CC_USAGE_TABLE_NAME", "ComplianceCopilot_Usage")
+TOOL_VERSIONS_TABLE_NAME = os.environ.get(
+    "CC_TOOL_VERSIONS_TABLE_NAME", "Compliance_Tool_Versions"
+)
 DYNAMO_BATCH_SIZE = 25
 
 # --- S3 Overflow ---
