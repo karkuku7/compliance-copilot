@@ -4,6 +4,8 @@ Retries only on QueryTimeoutError — all other exceptions propagate immediately
 Default delays: 1s → 2s → 4s (3 retries, base=1s, multiplier=2x).
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from functools import wraps

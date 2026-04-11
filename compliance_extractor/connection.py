@@ -4,6 +4,8 @@ Establishes and manages connections to a SQL data warehouse (e.g., Athena).
 Handles session lifecycle, query execution with polling, pagination, and timeouts.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import time

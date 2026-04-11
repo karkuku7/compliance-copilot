@@ -23,6 +23,8 @@ Hierarchy:
         └── TypeMismatchError
 """
 
+from __future__ import annotations
+
 
 class ExtractorError(Exception):
     """Base exception for all extractor errors."""

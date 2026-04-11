@@ -4,6 +4,8 @@ Validates that all required datasets are accessible before extraction.
 Uses lightweight probe queries and validates dataset names to prevent SQL injection.
 """
 
+from __future__ import annotations
+
 import logging
 import re
 from typing import Any

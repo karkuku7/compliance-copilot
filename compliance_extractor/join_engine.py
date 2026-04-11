@@ -7,6 +7,8 @@ Supports two query strategies:
 Both strategies produce the same output: flat rows with columns from all four tables.
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Any
 
@@ -22,6 +24,10 @@ from compliance_extractor.constants import (
 from compliance_extractor.errors import JoinFailureError, QueryTimeoutError
 
 logger = logging.getLogger(__name__)
+
+# Threshold for isolating outlier records into single-record sub-chunks.
+# Records with more data objects than this are processed separately to bound memory.
+PER_APP_DO_THRESHOLD = 100_000
 
 
 class JoinEngine:
@@ -138,23 +144,82 @@ class JoinEngine:
         except Exception as exc:
             raise JoinFailureError(f"JOIN execution failed: {exc}")
 
+    def _probe_data_object_counts(
+        self,
+        session: WarehouseSession,
+        app_names: list[str],
+        timeout_seconds: int,
+    ) -> dict[str, int]:
+        """Issue a lightweight COUNT query to get per-record data object counts.
+
+        Returns a dict of {record_id: data_object_count}.
+        """
+        if not app_names:
+            return {}
+
+        table = quote_table(TABLE_DATA_OBJECTS)
+        escaped = [n.replace("'", "''") for n in app_names]
+        in_clause = ", ".join(f"'{n}'" for n in escaped)
+        probe_query = (
+            f"SELECT application_name, COUNT(*) as do_count "
+            f"FROM {table} "
+            f"WHERE application_name IN ({in_clause}) "
+            f"GROUP BY application_name"
+        )
+
+        logger.info("Probing data object counts for %d records...", len(app_names))
+        try:
+            probe_result = session.execute_query(probe_query, timeout_seconds=timeout_seconds)
+            if not probe_result.get("success"):
+                logger.warning("Data object count probe failed — proceeding without isolation: %s",
+                               probe_result.get("error_message", ""))
+                return {}
+        except Exception as exc:
+            logger.warning("Data object count probe failed — proceeding without isolation: %s", exc)
+            return {}
+
+        counts: dict[str, int] = {}
+        for row in probe_result.get("data", []):
+            name = row.get("application_name")
+            count = row.get("do_count", 0)
+            if name:
+                counts[name] = int(count)
+
+        # Log outliers
+        outliers = {k: v for k, v in counts.items() if v > PER_APP_DO_THRESHOLD}
+        if outliers:
+            logger.info("Outlier records detected (>%d data objects): %s",
+                        PER_APP_DO_THRESHOLD,
+                        ", ".join(f"{k}={v:,}" for k, v in outliers.items()))
+        else:
+            logger.info("No outlier records detected (all below %d threshold)", PER_APP_DO_THRESHOLD)
+
+        return counts
+
     def execute_per_table(
         self,
         session: WarehouseSession,
         record_ids: list[str] | None = None,
         owner_logins: list[str] | None = None,
         timeout_seconds: int = 300,
+        _skip_probe: bool = False,
     ) -> list[dict[str, Any]]:
         """Query each table separately, then join in Python.
 
         Fallback strategy for when the four-table SQL JOIN times out.
         Slower for small datasets but handles arbitrarily large ones.
 
+        When multiple records are queried, a lightweight COUNT probe detects
+        outlier records (those exceeding PER_APP_DO_THRESHOLD data objects).
+        Outlier records are isolated into single-record sub-chunks to bound memory.
+
         Args:
             session: Active warehouse session.
             record_ids: Optional filter by record IDs.
             owner_logins: Optional filter by owner hierarchy.
             timeout_seconds: Per-query timeout.
+            _skip_probe: Internal flag to prevent recursive probing for
+                         single-record sub-chunks (already isolated).
 
         Returns:
             List of flat row dicts (same format as execute_join).
@@ -173,26 +238,70 @@ class JoinEngine:
         # Extract record IDs for filtering subsequent queries
         app_names = list({row.get("record_id", "") for row in apps if row.get("record_id")})
 
-        # Step 2: Query data stores filtered by app names
-        stores = self._query_filtered(
-            session, TABLE_DATA_STORES, "application_name", app_names, timeout_seconds
-        )
-        logger.info("Stores: %d rows", len(stores))
+        # ── Probe for outlier records ────────────────────────────────
+        # Only probe when there are multiple records and we haven't already
+        # been called as a single-record sub-chunk (_skip_probe).
+        outlier_apps: list[str] = []
+        normal_apps: list[str] = list(app_names)
+        do_counts: dict[str, int] = {}
 
-        # Step 3: Query data objects
-        objects = self._query_filtered(
-            session, TABLE_DATA_OBJECTS, "application_name", app_names, timeout_seconds
-        )
-        logger.info("Objects: %d rows", len(objects))
+        if not _skip_probe and len(app_names) > 1:
+            do_counts = self._probe_data_object_counts(session, app_names, timeout_seconds)
+            if do_counts:
+                outlier_apps = [a for a in app_names if do_counts.get(a, 0) > PER_APP_DO_THRESHOLD]
+                normal_apps = [a for a in app_names if a not in outlier_apps]
 
-        # Step 4: Query fields
-        fields = self._query_filtered(
-            session, TABLE_OBJECT_FIELDS, "application_name", app_names, timeout_seconds
-        )
-        logger.info("Fields: %d rows", len(fields))
+        # ── Process outlier records in single-record sub-chunks ──────
+        outlier_flat_rows: list[dict] = []
+        if outlier_apps:
+            logger.info("Isolating %d outlier record(s) into single-record sub-chunks: %s",
+                        len(outlier_apps),
+                        ", ".join(f"{a}({do_counts.get(a, 0):,} DOs)" for a in outlier_apps))
+            for outlier in outlier_apps:
+                logger.info("Processing isolated outlier record: %s (%d data objects)",
+                            outlier, do_counts.get(outlier, 0))
+                outlier_result = self.execute_per_table(
+                    session,
+                    record_ids=[outlier],
+                    timeout_seconds=timeout_seconds,
+                    _skip_probe=True,
+                )
+                outlier_flat_rows.extend(outlier_result)
 
-        # Step 5: Join in Python
-        return self._join_in_python(apps, stores, objects, fields)
+        # ── Process normal records in bulk (unchanged logic) ─────────
+        bulk_flat_rows: list[dict] = []
+        if normal_apps:
+            # Filter app rows to only normal records
+            normal_app_set = set(normal_apps)
+            bulk_apps = [r for r in apps if r.get("record_id") in normal_app_set]
+
+            # Step 2: Query data stores filtered by normal app names
+            stores = self._query_filtered(
+                session, TABLE_DATA_STORES, "application_name", normal_apps, timeout_seconds
+            )
+            logger.info("Stores: %d rows", len(stores))
+
+            # Step 3: Query data objects
+            objects = self._query_filtered(
+                session, TABLE_DATA_OBJECTS, "application_name", normal_apps, timeout_seconds
+            )
+            logger.info("Objects: %d rows", len(objects))
+
+            # Step 4: Query fields
+            fields = self._query_filtered(
+                session, TABLE_OBJECT_FIELDS, "application_name", normal_apps, timeout_seconds
+            )
+            logger.info("Fields: %d rows", len(fields))
+
+            # Step 5: Join in Python
+            bulk_flat_rows = self._join_in_python(bulk_apps, stores, objects, fields)
+
+        # ── Merge results from bulk + outlier processing ─────────────
+        all_flat_rows = bulk_flat_rows + outlier_flat_rows
+        logger.info("Per-table query complete: %d flat rows (normal=%d, outlier=%d)",
+                    len(all_flat_rows), len(bulk_flat_rows), len(outlier_flat_rows))
+
+        return all_flat_rows
 
     def _build_app_query(
         self,
