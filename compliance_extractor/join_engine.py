@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 # Records with more data objects than this are processed separately to bound memory.
 PER_APP_DO_THRESHOLD = 100_000
 
+# Threshold for logging a warning when a single data store has an extremely
+# large number of data objects (beyond known data distribution).
+LARGE_DS_WARNING_THRESHOLD = 500_000
+
+# Batch size for object_id IN clauses (warehouse has limits on IN clause size).
+OBJECT_ID_BATCH_SIZE = 1_000
+
 
 class JoinEngine:
     """Orchestrates multi-table joins with fallback strategies."""
@@ -250,6 +257,123 @@ class JoinEngine:
             if do_counts:
                 outlier_apps = [a for a in app_names if do_counts.get(a, 0) > PER_APP_DO_THRESHOLD]
                 normal_apps = [a for a in app_names if a not in outlier_apps]
+
+        # ── Phase 2: Per-data-store processing for isolated outlier records ─
+        # When _skip_probe=True and we have a single record, re-probe to check
+        # if per-data-store decomposition is needed.
+        if _skip_probe and len(app_names) == 1:
+            do_counts = self._probe_data_object_counts(session, app_names, timeout_seconds)
+            total_do = do_counts.get(app_names[0], 0)
+
+            if total_do > PER_APP_DO_THRESHOLD:
+                logger.info(
+                    "Activating per-data-store processing for outlier record: %s (%d data objects)",
+                    app_names[0], total_do,
+                )
+                # Query data stores for the isolated record
+                escaped_app = app_names[0].replace("'", "''")
+                store_table = quote_table(TABLE_DATA_STORES)
+                ds_query = (
+                    f"SELECT * FROM {store_table} "
+                    f"WHERE application_name = '{escaped_app}'"
+                )
+
+                logger.info("Querying data stores for outlier record: %s", app_names[0])
+                ds_result = session.execute_query(ds_query, timeout_seconds=timeout_seconds)
+                if not ds_result.get("success"):
+                    raise JoinFailureError(
+                        "Data stores query failed for outlier record: "
+                        + ds_result.get("error_message", "")
+                    )
+                ds_rows = ds_result.get("data", [])
+                logger.info("Data stores for %s: %d rows", app_names[0], len(ds_rows))
+
+                # Per-data-store loop
+                all_flat_rows: list[dict] = []
+                for ds in ds_rows:
+                    ds_id = ds.get("store_id", "")
+                    escaped_ds_id = str(ds_id).replace("'", "''") if ds_id else ""
+
+                    # Query data_objects for this data store
+                    obj_table = quote_table(TABLE_DATA_OBJECTS)
+                    do_query = (
+                        f"SELECT * FROM {obj_table} "
+                        f"WHERE application_name = '{escaped_app}' "
+                        f"AND data_store_id = '{escaped_ds_id}'"
+                    )
+
+                    do_result = session.execute_query(do_query, timeout_seconds=timeout_seconds)
+                    if not do_result.get("success"):
+                        raise JoinFailureError(
+                            f"Data objects query failed for data store {ds_id}: "
+                            + do_result.get("error_message", "")
+                        )
+                    do_rows_for_ds = do_result.get("data", [])
+                    do_count = len(do_rows_for_ds)
+
+                    # Log warning for large data stores
+                    if do_count > LARGE_DS_WARNING_THRESHOLD:
+                        logger.warning(
+                            "Large data store detected: %s in record %s has %d data objects "
+                            "(exceeds %d threshold)",
+                            ds_id, app_names[0], do_count, LARGE_DS_WARNING_THRESHOLD,
+                        )
+
+                    # Query object_fields for this data store's objects
+                    object_ids = [
+                        str(r.get("object_id", ""))
+                        for r in do_rows_for_ds if r.get("object_id")
+                    ]
+                    f_rows_for_ds: list[dict] = []
+
+                    if object_ids:
+                        field_table = quote_table(TABLE_OBJECT_FIELDS)
+                        # Batch object_ids to avoid IN clause limits
+                        for batch_start in range(0, len(object_ids), OBJECT_ID_BATCH_SIZE):
+                            batch_ids = object_ids[batch_start:batch_start + OBJECT_ID_BATCH_SIZE]
+                            escaped_ids = [oid.replace("'", "''") for oid in batch_ids]
+                            id_in_clause = ", ".join(f"'{oid}'" for oid in escaped_ids)
+
+                            f_query = (
+                                f"SELECT * FROM {field_table} "
+                                f"WHERE application_name = '{escaped_app}' "
+                                f"AND object_id IN ({id_in_clause})"
+                            )
+
+                            f_result = session.execute_query(f_query, timeout_seconds=timeout_seconds)
+                            if not f_result.get("success"):
+                                raise JoinFailureError(
+                                    f"Object fields query failed for data store {ds_id}: "
+                                    + f_result.get("error_message", "")
+                                )
+                            f_rows_for_ds.extend(f_result.get("data", []))
+
+                    f_count = len(f_rows_for_ds)
+
+                    # Per-data-store join and memory management
+                    ds_flat_rows = self._join_in_python(
+                        [apps[0]], [ds], do_rows_for_ds, f_rows_for_ds,
+                    )
+                    flat_count = len(ds_flat_rows)
+                    all_flat_rows.extend(ds_flat_rows)
+
+                    logger.info(
+                        "Data store %s: %d DOs, %d fields, %d flat rows",
+                        ds_id, do_count, f_count, flat_count,
+                    )
+
+                    # Free per-data-store intermediate data
+                    del do_rows_for_ds, f_rows_for_ds, ds_flat_rows
+
+                # Handle records with no data stores (record-only row)
+                if not ds_rows:
+                    all_flat_rows.append({**apps[0]})
+
+                logger.info(
+                    "Per-data-store processing complete for %s: %d flat rows",
+                    app_names[0], len(all_flat_rows),
+                )
+                return all_flat_rows
 
         # ── Process outlier records in single-record sub-chunks ──────
         outlier_flat_rows: list[dict] = []

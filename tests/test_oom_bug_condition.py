@@ -280,3 +280,141 @@ class TestVolumeBlindChunkSizing:
             f"smaller than baseline ({baseline}), but it wasn't. "
             f"_estimate_chunk_size() ignores per-record data volume."
         )
+
+
+# ── Test 5: Phase 2 — Isolated outlier still loads all tables at once ─
+
+class TestPhase2OutlierPerDataStoreDecomposition:
+    """execute_per_table() with _skip_probe=True for an outlier record should
+    decompose processing per data store.
+
+    On current Phase-1-only code, _skip_probe=True causes the method to
+    skip the probe and proceed with 4 bulk queries (apps, data_stores,
+    data_objects, object_fields) — no per-data-store decomposition.
+
+    The EXPECTED (fixed) behavior is that when _skip_probe=True and the
+    record exceeds PER_APP_DO_THRESHOLD, the method should:
+    1. Query applications (1 query)
+    2. Query data stores (1 query)
+    3. For EACH data store, query data_objects with WHERE data_store_id = ...
+    4. For EACH data store, query object_fields with WHERE ... for that store's objects
+    This means MORE than 4 total queries, with per-data-store filtering.
+    """
+
+    def test_isolated_outlier_issues_per_data_store_queries(self):
+        """Fixed execute_per_table() with _skip_probe=True should issue
+        per-data-store queries for data_objects and object_fields.
+
+        On Phase-1-only code, this FAILS because _skip_probe=True skips
+        the probe and proceeds with exactly 4 bulk queries — no per-data-store
+        decomposition occurs.
+        """
+        record_id = "outlier-record"
+        ds_ids = ["ds-1", "ds-2", "ds-3"]
+        # 200K+ data objects split across 3 data stores
+        do_per_ds = {
+            "ds-1": 80_000,
+            "ds-2": 70_000,
+            "ds-3": 60_000,
+        }
+        total_do = sum(do_per_ds.values())  # 210,000
+
+        # Track all queries issued
+        issued_queries: list[str] = []
+
+        mock_session = MagicMock()
+        mock_session.is_active = True
+
+        def side_effect(query, **kwargs):
+            issued_queries.append(query)
+            q = query.lower()
+
+            # COUNT probe query (Phase 2 may re-probe)
+            if "count" in q and "group by" in q:
+                return {
+                    "success": True,
+                    "data": [
+                        {"application_name": record_id, "do_count": total_do},
+                    ],
+                }
+
+            # Object fields query — check if per-data-store or bulk
+            if "object_fields" in q or "field_name" in q:
+                rows = []
+                for ds_id, count in do_per_ds.items():
+                    for i in range(min(count, 5)):  # limit rows for test speed
+                        obj_id = f"{ds_id}-obj-{i}"
+                        rows.append(_make_field_row(record_id, obj_id, f"field-{obj_id}"))
+                return {"success": True, "data": rows}
+
+            # Data objects query — check if per-data-store or bulk
+            if "data_objects" in q or "object_name" in q:
+                # Check if this is a per-data-store query (has data_store_id filter)
+                if "data_store_id" in q:
+                    # Per-data-store query — find which ds_id
+                    for ds_id in ds_ids:
+                        if ds_id in query:
+                            count = do_per_ds[ds_id]
+                            rows = [
+                                _make_do_row(record_id, ds_id, f"{ds_id}-obj-{i}")
+                                for i in range(min(count, 5))  # limit for speed
+                            ]
+                            return {"success": True, "data": rows}
+                    # Fallback if ds_id not found in query
+                    return {"success": True, "data": []}
+                else:
+                    # Bulk query — return all data objects across all stores
+                    rows = []
+                    for ds_id, count in do_per_ds.items():
+                        for i in range(min(count, 5)):  # limit for speed
+                            rows.append(
+                                _make_do_row(record_id, ds_id, f"{ds_id}-obj-{i}")
+                            )
+                    return {"success": True, "data": rows}
+
+            # Data stores query
+            if "data_stores" in q or "store_name" in q:
+                rows = [_make_ds_row(record_id, ds_id) for ds_id in ds_ids]
+                return {"success": True, "data": rows}
+
+            # Applications query
+            rows = [_make_app_row(record_id)]
+            return {"success": True, "data": rows}
+
+        mock_session.execute_query = MagicMock(side_effect=side_effect)
+
+        engine = JoinEngine()
+        result = engine.execute_per_table(
+            mock_session,
+            record_ids=[record_id],
+            _skip_probe=True,
+            timeout_seconds=600,
+        )
+
+        # Result should contain rows
+        assert len(result) > 0
+
+        # Key assertion: the fixed code should issue MORE than 4 queries.
+        # Phase-1-only code issues exactly 4: apps, data_stores, data_objects,
+        # object_fields — all bulk, no per-data-store filtering.
+        # Phase 2 fixed code should issue:
+        #   1 (probe) + 1 (apps) + 1 (data_stores) + 3 (data_objects per ds) + 3 (fields per ds) = 9+
+        call_count = mock_session.execute_query.call_count
+        assert call_count > 4, (
+            f"Expected more than 4 session.execute_query() calls "
+            f"(per-data-store decomposition), but got {call_count}. "
+            f"This means execute_per_table() with _skip_probe=True did NOT "
+            f"decompose processing per data store — the Phase 2 bug is confirmed: "
+            f"isolated outlier record still loads all 4 tables at once."
+        )
+
+        # Also verify that per-data-store queries were issued — look for
+        # queries containing 'data_store_id' in the WHERE clause
+        per_ds_queries = [
+            q for q in issued_queries if "data_store_id" in q.lower()
+        ]
+        assert len(per_ds_queries) > 0, (
+            f"Expected per-data-store queries with 'data_store_id' in WHERE "
+            f"clause, but found none. All {call_count} queries were bulk queries. "
+            f"This confirms the Phase 2 bug: no per-data-store decomposition."
+        )

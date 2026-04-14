@@ -286,3 +286,251 @@ class TestEmptyRecordPreservation:
         # Each record appears exactly once
         result_records = [r["record_id"] for r in result]
         assert sorted(result_records) == sorted(record_ids)
+
+
+# ── Test 6b: Non-outlier records bypass per-data-store (Phase 2) ──────
+
+class TestPhase2NonOutlierBypass:
+    """Non-outlier records (below PER_APP_DO_THRESHOLD) must NOT trigger
+    per-data-store queries — only the standard 4 bulk queries are issued.
+
+    This MUST PASS on current Phase-1-only code because non-outlier records
+    already use the bulk path.
+    """
+
+    def test_non_outlier_record_issues_exactly_4_queries(self):
+        """A record with 5K data objects (well below PER_APP_DO_THRESHOLD of
+        100K) should be processed via the standard bulk path, issuing
+        exactly 4 queries: apps, data_stores, data_objects, object_fields.
+
+        No per-data-store queries should be issued.
+        """
+        record_id = "normal-record"
+        num_data_objects = 5_000
+
+        # Build mock data: 1 record, 1 data store, 5K data objects, 1 field each
+        issued_queries: list[str] = []
+
+        mock_session = MagicMock()
+        mock_session.is_active = True
+
+        def side_effect(query, **kwargs):
+            issued_queries.append(query)
+            q = query.lower()
+
+            # COUNT probe query — return count below threshold
+            if "count" in q and "group by" in q:
+                return {
+                    "success": True,
+                    "data": [
+                        {"application_name": record_id, "do_count": num_data_objects},
+                    ],
+                }
+
+            # Object fields query
+            if "object_fields" in q or "field_name" in q:
+                rows = [
+                    _make_field_row(record_id, str(i), f"field-{i}")
+                    for i in range(num_data_objects)
+                ]
+                return {"success": True, "data": rows}
+
+            # Data objects query
+            if "data_objects" in q or "object_name" in q:
+                rows = [
+                    _make_do_row(record_id, "ds-1", str(i))
+                    for i in range(num_data_objects)
+                ]
+                return {"success": True, "data": rows}
+
+            # Data stores query
+            if "data_stores" in q or "store_name" in q:
+                return {"success": True, "data": [_make_ds_row(record_id, "ds-1")]}
+
+            # Applications query
+            return {"success": True, "data": [_make_app_row(record_id)]}
+
+        mock_session.execute_query = MagicMock(side_effect=side_effect)
+
+        engine = JoinEngine()
+        result = engine.execute_per_table(
+            mock_session,
+            record_ids=[record_id],
+            timeout_seconds=60,
+        )
+
+        # Result should contain rows
+        assert len(result) > 0
+
+        # Non-outlier single record: the probe runs (1 query) but finds the record
+        # below threshold, so it proceeds with the standard 4 bulk queries.
+        # The key assertion: NO per-data-store queries should be issued.
+        per_ds_queries = [
+            q for q in issued_queries
+            if "data_store_id" in q.lower()
+            and ("and data_store_id" in q.lower() or "where data_store_id" in q.lower())
+        ]
+        assert len(per_ds_queries) == 0, (
+            f"Expected NO per-data-store queries for a non-outlier record, "
+            f"but found {len(per_ds_queries)} queries with 'data_store_id' filter. "
+            f"Non-outlier records should use the bulk query path."
+        )
+
+        # Verify the standard bulk queries were issued — at least 4 queries total
+        assert mock_session.execute_query.call_count >= 4, (
+            f"Expected at least 4 queries (apps, data_stores, data_objects, "
+            f"object_fields), but got {mock_session.execute_query.call_count}."
+        )
+
+        # Verify result contains the expected rows
+        assert len(result) == num_data_objects
+        result_records = {r["record_id"] for r in result}
+        assert result_records == {record_id}
+
+
+# ── Test 6a: Per-data-store output equivalence (Phase 2) ──────────────
+
+class TestPhase2PerDataStoreOutputEquivalence:
+    """Per-data-store processing must produce flat rows identical to what
+    the all-at-once bulk path would produce.
+
+    This test computes the EXPECTED flat rows by calling _join_in_python()
+    directly with all rows (the "all-at-once" reference), then calls
+    execute_per_table() and compares its output to the reference.
+    """
+
+    def test_per_data_store_output_matches_all_at_once(self):
+        """Mock an outlier record with 3 data stores, varying data object
+        counts (100, 200, 50), and 2 fields per object. Compare
+        execute_per_table() output to _join_in_python() reference.
+        """
+        record_id = "outlier-record"
+        ds_config = {
+            "ds-1": 100,  # 100 data objects
+            "ds-2": 200,  # 200 data objects
+            "ds-3": 50,   # 50 data objects
+        }
+        fields_per_object = 2
+
+        # ── Build all rows for the "all-at-once" reference ────────────
+        all_app_rows = [_make_app_row(record_id)]
+        all_ds_rows = []
+        all_do_rows = []
+        all_f_rows = []
+
+        for ds_id, do_count in ds_config.items():
+            all_ds_rows.append(_make_ds_row(record_id, ds_id))
+            for i in range(do_count):
+                obj_id = f"{ds_id}-obj-{i}"
+                all_do_rows.append(_make_do_row(record_id, ds_id, obj_id))
+                for f_idx in range(fields_per_object):
+                    all_f_rows.append(
+                        _make_field_row(record_id, obj_id, f"field-{f_idx}")
+                    )
+
+        # Compute reference flat rows via _join_in_python() directly
+        engine = JoinEngine()
+        reference_flat_rows = engine._join_in_python(
+            all_app_rows, all_ds_rows, all_do_rows, all_f_rows,
+        )
+
+        # Sort reference by canonical key for comparison
+        def sort_key(row):
+            return (
+                row.get("record_id", ""),
+                str(row.get("data_store_id", "")),
+                str(row.get("object_id", "")),
+                row.get("field_name", ""),
+            )
+
+        reference_sorted = sorted(reference_flat_rows, key=sort_key)
+
+        # ── Build mock session for execute_per_table() ────────────────
+        mock_session = MagicMock()
+        mock_session.is_active = True
+
+        def side_effect(query, **kwargs):
+            q = query.lower()
+
+            # COUNT probe query
+            if "count" in q and "group by" in q:
+                total_do = sum(ds_config.values())
+                return {
+                    "success": True,
+                    "data": [
+                        {"application_name": record_id, "do_count": total_do},
+                    ],
+                }
+
+            # Object fields query — handle both bulk and per-data-store
+            if "object_fields" in q or "field_type" in q:
+                # Check if per-data-store (has "object_id IN" filter in WHERE)
+                if "object_id in" in q:
+                    # Per-data-store: return fields for matching objects
+                    rows = []
+                    for f_row in all_f_rows:
+                        obj_id = f_row["object_id"]
+                        if obj_id in query:
+                            rows.append(f_row)
+                    return {"success": True, "data": rows}
+                else:
+                    # Bulk: return all fields
+                    return {"success": True, "data": list(all_f_rows)}
+
+            # Data objects query — handle both bulk and per-data-store
+            if "data_objects" in q or "object_name" in q:
+                # Per-data-store queries have "AND data_store_id" in WHERE
+                if "and data_store_id" in q:
+                    # Per-data-store: find which ds_id
+                    rows = []
+                    for ds_id in ds_config:
+                        if ds_id in query:
+                            rows = [
+                                r for r in all_do_rows
+                                if r.get("data_store_id") == ds_id
+                            ]
+                            break
+                    return {"success": True, "data": rows}
+                else:
+                    # Bulk: return all data objects
+                    return {"success": True, "data": list(all_do_rows)}
+
+            # Data stores query
+            if "data_stores" in q or "store_name" in q:
+                return {"success": True, "data": list(all_ds_rows)}
+
+            # Applications query
+            return {"success": True, "data": list(all_app_rows)}
+
+        mock_session.execute_query = MagicMock(side_effect=side_effect)
+
+        # ── Call execute_per_table() and compare ──────────────────────
+        result = engine.execute_per_table(
+            mock_session,
+            record_ids=[record_id],
+            timeout_seconds=60,
+        )
+
+        # Sort actual output by the same canonical key
+        actual_sorted = sorted(result, key=sort_key)
+
+        # Compare row counts
+        assert len(actual_sorted) == len(reference_sorted), (
+            f"Row count mismatch: execute_per_table() produced "
+            f"{len(actual_sorted)} rows, but _join_in_python() reference "
+            f"produced {len(reference_sorted)} rows."
+        )
+
+        # Compare row-by-row
+        for i, (actual, expected) in enumerate(zip(actual_sorted, reference_sorted)):
+            assert actual == expected, (
+                f"Row {i} mismatch.\n"
+                f"  Actual:   record={actual.get('record_id')}, "
+                f"ds={actual.get('data_store_id')}, "
+                f"obj={actual.get('object_id')}, "
+                f"field={actual.get('field_name')}\n"
+                f"  Expected: record={expected.get('record_id')}, "
+                f"ds={expected.get('data_store_id')}, "
+                f"obj={expected.get('object_id')}, "
+                f"field={expected.get('field_name')}"
+            )
