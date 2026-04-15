@@ -50,6 +50,12 @@ OVERFLOW_BUCKET_NAME = os.environ.get(
 OVERFLOW_KEY_PREFIX = "cache/"
 OVERFLOW_THRESHOLD_BYTES = 400_000  # DynamoDB 400KB item limit
 
+# Orphaned data objects sentinel
+# Data objects with data_store_id = NULL (e.g. warehouse tables registered
+# directly without a parent data store) are grouped under a synthetic
+# data store with this sentinel value for both ID and name.
+ORPHANED_SENTINEL = "__ORPHANED__"
+
 # --- Lambda ---
 CACHE_LOADER_LAMBDA_NAME = "ComplianceCopilot-CacheLoader"
 CACHE_LOADER_MEMORY_MB = 512

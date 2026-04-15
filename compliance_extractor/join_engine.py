@@ -19,6 +19,7 @@ from compliance_extractor.constants import (
     TABLE_DATA_OBJECTS,
     TABLE_OBJECT_FIELDS,
     WAREHOUSE_DATABASE,
+    ORPHANED_SENTINEL,
     quote_table,
 )
 from compliance_extractor.errors import JoinFailureError, QueryTimeoutError
@@ -486,9 +487,14 @@ class JoinEngine:
 
         # Index objects by (application_name, data_store_id)
         objects_by_store: dict[tuple[str, str], list[dict]] = {}
+        orphaned_by_app: dict[str, list[dict]] = {}
         for o in objects:
-            key = (o.get("application_name", ""), o.get("data_store_id", ""))
-            objects_by_store.setdefault(key, []).append(o)
+            app_key = o.get("application_name", "")
+            ds_id = str(o.get("data_store_id") or "")
+            if app_key and ds_id:
+                objects_by_store.setdefault((app_key, ds_id), []).append(o)
+            elif app_key:
+                orphaned_by_app.setdefault(app_key, []).append(o)
 
         # Index fields by (application_name, object_id)
         fields_by_object: dict[tuple[str, str], list[dict]] = {}
@@ -500,7 +506,12 @@ class JoinEngine:
         rows: list[dict[str, Any]] = []
         for app in apps:
             app_name = app.get("record_id", "")
-            app_stores = stores_by_app.get(app_name, [{}])
+            app_stores = stores_by_app.get(app_name, [])
+            orphaned_objects = orphaned_by_app.get(app_name, [])
+
+            if not app_stores and not orphaned_objects:
+                rows.append({**app})
+                continue
 
             for store in app_stores:
                 store_id = store.get("store_id", "")
@@ -528,5 +539,28 @@ class JoinEngine:
                             }
                         )
                         rows.append(row)
+
+            # Process orphaned objects with synthetic DS columns
+            for obj in orphaned_objects:
+                obj_id = obj.get("object_id", "")
+                obj_fields = fields_by_object.get((app_name, obj_id), [{}])
+                synthetic_ds = {
+                    "data_store_name": ORPHANED_SENTINEL,
+                    "data_store_id": ORPHANED_SENTINEL,
+                    "store_technology": obj.get("technology", ""),
+                }
+                for field in obj_fields:
+                    row = {**app}
+                    row.update({
+                        **synthetic_ds,
+                        "data_object_name": obj.get("object_name"),
+                        "object_id": obj_id,
+                        "object_has_sensitive_data": obj.get("has_sensitive_data"),
+                        "retention_days": obj.get("retention_days"),
+                        "field_name": field.get("field_name"),
+                        "field_description": field.get("field_description"),
+                        "field_type": field.get("field_type"),
+                    })
+                    rows.append(row)
 
         return rows

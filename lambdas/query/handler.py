@@ -7,6 +7,8 @@ Supports:
 - Usage tracking: Atomic counters in a separate Usage Table
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -58,6 +60,22 @@ def handler(event: dict, context: Any) -> dict:
 
 def _handle_exact(record_id: str, event: dict) -> dict:
     """Handle exact match lookup."""
+    # --- Server-side version enforcement ---
+    # Only enforce version check for known tool clients (CLI/MCP).
+    # Direct API callers (browsers, curl, other services) skip this check.
+    headers = event.get("headers") or {}
+    source = headers.get("x-source", "")
+    client_version = headers.get("x-tool-version", "")
+    if source in ("cli", "mcp") and not client_version:
+        return _response(426, {
+            "error": "UpgradeRequired",
+            "message": (
+                "Your compliance-copilot tool is outdated and no longer supported.\n"
+                "Please upgrade:\n"
+                "  pip install --upgrade compliance-copilot"
+            ),
+        })
+
     result = cache_table.get_item(Key={"record_id": record_id})
     item = result.get("Item")
 

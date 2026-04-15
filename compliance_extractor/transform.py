@@ -8,6 +8,8 @@ Handles:
 
 from typing import Any
 
+from compliance_extractor.constants import ORPHANED_SENTINEL
+
 
 def parse_struct(value: str) -> dict[str, Any]:
     """Recursively parse a warehouse struct string into a Python dict.
@@ -177,26 +179,43 @@ def transform_rows_to_hierarchical(
 
         app = apps[record_id]
         store_id = row.get("data_store_id")
+        object_id = row.get("object_id")
+
+        # Route orphaned rows (no data_store_id but valid object_id)
+        # to a synthetic __ORPHANED__ data store instead of dropping them.
         if not store_id:
-            continue
+            if not object_id:
+                # No data_store_id AND no object_id — nothing to nest
+                continue
+            # Orphaned row: use sentinel values
+            store_id = ORPHANED_SENTINEL
 
         # Initialize store if first time seeing it
         if store_id not in app["_store_index"]:
-            store = {
-                "store_name": row.get("data_store_name", ""),
-                "store_id": store_id,
-                "technology": row.get("store_technology", ""),
-                "has_sensitive_data": to_bool(
-                    row.get("store_has_sensitive_data", False)
-                ),
-                "data_objects": [],
-                "_object_index": {},
-            }
+            if store_id == ORPHANED_SENTINEL:
+                store = {
+                    "store_name": ORPHANED_SENTINEL,
+                    "store_id": ORPHANED_SENTINEL,
+                    "technology": row.get("store_technology", ""),
+                    "has_sensitive_data": False,
+                    "data_objects": [],
+                    "_object_index": {},
+                }
+            else:
+                store = {
+                    "store_name": row.get("data_store_name", ""),
+                    "store_id": store_id,
+                    "technology": row.get("store_technology", ""),
+                    "has_sensitive_data": to_bool(
+                        row.get("store_has_sensitive_data", False)
+                    ),
+                    "data_objects": [],
+                    "_object_index": {},
+                }
             app["data_stores"].append(store)
             app["_store_index"][store_id] = store
 
         store = app["_store_index"][store_id]
-        object_id = row.get("object_id")
         if not object_id:
             continue
 

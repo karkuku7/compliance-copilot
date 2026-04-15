@@ -15,6 +15,7 @@ import logging
 import os
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
@@ -149,7 +150,6 @@ def format_block_message(
         f"   Please update immediately:\n"
         f"{_upgrade_instructions(tool_name, indent='     ')}"
     )
-
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +320,7 @@ def check_version_sync(
             )
 
     # 2. Fetch from API
-    url = f"{api_url}/version?tool_name={urllib.request.quote(tool_name, safe='')}"
+    url = f"{api_url}/version?tool_name={urllib.parse.quote(tool_name, safe='')}"
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECONDS) as resp:
